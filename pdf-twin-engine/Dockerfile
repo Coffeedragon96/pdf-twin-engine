@@ -39,9 +39,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy application source
 COPY . .
 
-# Create temp directories
-RUN mkdir -p /tmp/pdf_twin_uploads /tmp/pdf_twin_outputs
-
-EXPOSE 8000
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "app.worker.consumer"]

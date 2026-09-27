@@ -1,192 +1,70 @@
 # PDF to Twin Conversion Engine
 
-A standalone FastAPI microservice that converts 2D architectural floor plan PDFs into 3D Digital Twin models in glTF/GLB format, ready for integration with the MWX-X2 platform and Cesium viewer.
+An SQS-consumer external processor that converts 2D architectural floor plan PDFs into 3D Digital Twin models in glTF/GLB format, running inside the MWX-X2 platform's compose stack and feeding the Cesium viewer.
 
 ---
 
 ## Overview
 
-The engine accepts a floor plan PDF and building metadata via REST API, processes it through a multi-stage AI pipeline, and returns a downloadable 3D GLB model along with structured floor schema data.
+The engine is an X2 "external processor" for the `pdf_twin` job kind (see
+`x2-backend/worker/CONTRACT.md`). It consumes job dispatch from a dedicated
+SQS-compatible queue (`SQS_QUEUE_PDF_TWIN`, default `x2-jobs-pdf_twin`),
+downloads the source PDF from the shared uploads bucket, runs it through a
+multi-stage AI pipeline, and writes the result directly to the shared
+Postgres `processing_jobs`/`artifacts` tables and the shared artifacts
+bucket — the same contract every other X2 job kind (Go or Python) writes.
 
 ```
-PDF Upload → Extract → Claude Vision Interpret → 3D Reconstruct → GLB Export → Platform Callback
+SQS dispatch → download PDF → Extract → Claude Vision Interpret → 3D Reconstruct → GLB upload + artifact row
 ```
-
----
 
 ## Architecture
 
 ```
 pdf-twin-engine/
 ├── app/
-│   ├── api/
-│   │   ├── routes.py        # POST /jobs, GET /jobs/{id}
-│   │   └── schemas.py       # Pydantic request/response models
 │   ├── core/
 │   │   ├── config.py        # Environment config via pydantic-settings
-│   │   └── celery_app.py    # Celery + Redis broker setup
+│   │   └── db.py            # Postgres access for the job/artifact contract
 │   ├── services/
 │   │   ├── extractor.py     # PyMuPDF — PDF → base64 images + vector geometry
 │   │   ├── interpreter.py   # Claude Vision — images → structured floor schema
 │   │   ├── reconstructor.py # trimesh — 2D schema → 3D GLB mesh
-│   │   └── emitter.py       # boto3 — GLB upload to S3 + platform callback
-│   ├── worker/
-│   │   └── tasks.py         # Celery task orchestrating the full pipeline
-│   └── main.py              # FastAPI app initialisation
+│   │   └── emitter.py       # boto3 — GLB upload to the shared artifacts bucket
+│   └── worker/
+│       └── consumer.py      # SQS long-poll loop: claim, heartbeat, run pipeline, persist
 ├── Dockerfile
-├── docker-compose.yml
 ├── requirements.txt
 └── .env.example
 ```
 
----
-
-## Pipeline Stages
-
-| Stage | Service | Description |
-|-------|---------|-------------|
-| 1. Intake | `routes.py` | Receives PDF + metadata, saves to `/tmp/`, enqueues Celery job |
-| 2. Extract | `extractor.py` | Renders each PDF page to high-res JPEG; extracts vector geometry from CAD PDFs |
-| 3. Interpret | `interpreter.py` | Sends page images to Claude Vision; returns structured JSON with floors, walls, rooms |
-| 4. Reconstruct | `reconstructor.py` | Extrudes wall segments into 3D boxes; stacks floors with concrete slabs |
-| 5. Emit | `emitter.py` | Uploads GLB to S3; fires webhook callback to main platform |
-
----
-
-## API Reference
-
-### Submit a job
-
-```
-POST /api/v1/jobs
-Content-Type: multipart/form-data
-```
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `file` | PDF | ✅ | Floor plan PDF |
-| `building_name` | string | ✅ | Name of the building |
-| `address` | string | — | Physical address |
-| `floors` | integer | — | Expected number of floors |
-| `scale_meters` | float | — | Known scale in metres per unit |
-
-**Response**
-```json
-{
-  "job_id": "b01847ba-ddbb-4378-8ce7-c88c06629f14",
-  "status": "pending",
-  "message": "Job accepted. Processing started in background."
-}
-```
-
----
-
-### Check job status
-
-```
-GET /api/v1/jobs/{job_id}
-```
-
-**Response**
-```json
-{
-  "job_id": "b01847ba-ddbb-4378-8ce7-c88c06629f14",
-  "status": "completed",
-  "progress": 100,
-  "result_url": "https://s3.amazonaws.com/bucket/twins/b01847ba/model.glb",
-  "metadata": {
-    "floors": 2,
-    "confidence": 0.94,
-    "building": "Tower A"
-  }
-}
-```
-
-Job status values: `pending` → `processing` → `completed` / `failed`
-
----
-
-### Health check
-
-```
-GET /health
-```
-
-```json
-{ "status": "healthy", "service": "pdf-twin-engine" }
-```
-
----
-
-## Getting Started
-
-### Prerequisites
-- Docker Desktop
-- Anthropic API key
-- AWS S3 bucket (optional — dev mode uses local file path)
-
-### Setup
-
-```bash
-git clone <repo>
-cd pdf-twin-engine
-
-cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
-```
-
-### Run
-
-```bash
-docker-compose up --build
-```
-
-This starts three containers:
-- `pdf_twin_redis` — message broker
-- `pdf_twin_api` — REST API on port 8000
-- `pdf_twin_worker` — Celery background processor
-
-### Test
-
-Open the interactive API docs:
-```
-http://localhost:8000/docs
-```
-
-Or submit a job via curl:
-```bash
-curl -X POST http://localhost:8000/api/v1/jobs \
-  -F "file=@floorplan.pdf;type=application/pdf" \
-  -F "building_name=Tower A" \
-  -F "floors=3"
-```
-
----
-
 ## Environment Variables
 
 | Variable | Required | Description |
-|----------|----------|-------------|
-| `ANTHROPIC_API_KEY` | ✅ | Claude Vision API key |
-| `REDIS_HOST` | ✅ | Redis host (default: `redis`) |
-| `REDIS_PORT` | ✅ | Redis port (default: `6379`) |
-| `AWS_ACCESS_KEY_ID` | — | S3 upload (optional in dev) |
-| `AWS_SECRET_ACCESS_KEY` | — | S3 upload (optional in dev) |
-| `AWS_S3_BUCKET` | — | S3 bucket name |
-| `AWS_S3_REGION` | — | S3 region (default: `us-east-1`) |
-| `PLATFORM_CALLBACK_URL` | — | Webhook URL for job completion |
+|----------|----------|--------------|
+| `ANTHROPIC_API_KEY` | ✅ | Claude Vision API key (same value X2's `internal/ai` module is provisioned with) |
+| `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD`/`DB_NAME` | ✅ | Shared Postgres |
+| `S3_ENDPOINT`/`S3_REGION`/`S3_ACCESS_KEY`/`S3_SECRET_KEY`/`S3_BUCKET_ARTIFACTS` | ✅ | Shared S3-compatible artifact storage |
+| `SQS_ENDPOINT`/`SQS_REGION`/`SQS_QUEUE_PDF_TWIN` | ✅ | Shared SQS-compatible dispatch queue |
+
+## Running it
+
+This engine is one service inside the X2 compose stack
+(`x2-backend/deploy/docker-compose.yml`, service `pdf-twin-engine`) — it is
+not run standalone. `docker compose up -d --build pdf-twin-engine` from
+`x2-backend/deploy` builds and starts it alongside Postgres/MinIO/ElasticMQ.
 
 ---
 
 ## Integration with MWX-X2 Platform
 
-The service is designed to be called as an independent entity from the main platform:
+The engine is called through the shared X2 job contract, not directly:
 
-1. Platform POSTs a floor plan PDF to `POST /api/v1/jobs`
-2. Service returns a `job_id` immediately
-3. Platform polls `GET /api/v1/jobs/{job_id}` for status
-4. On completion, the GLB model URL is available in `result_url`
-5. Optionally, the service fires a webhook to `PLATFORM_CALLBACK_URL` with the result
+1. `x2-backend` creates a `processing_jobs` row for a `pdf_twin` job and dispatches a message to `SQS_QUEUE_PDF_TWIN`.
+2. This consumer claims the message, downloads the source PDF from the shared uploads bucket, and runs the pipeline.
+3. It periodically heartbeats the job row while running, and marks it `completed`/`failed` on exit.
+4. On success, it uploads the GLB to the shared artifacts bucket and writes an `artifacts` row pointing to it.
+5. `x2-backend`/the portals read job status and artifact rows straight from Postgres — there is no callback or webhook.
 
 The GLB output is compatible with the Cesium viewer used in the MWX-X2 Digital Twin dashboard.
 
@@ -194,11 +72,10 @@ The GLB output is compatible with the Cesium viewer used in the MWX-X2 Digital T
 
 ## Tech Stack
 
-- **FastAPI** — REST API framework
-- **Celery + Redis** — Async job queue
+- **boto3** — SQS job dispatch consumption and S3-compatible artifact storage
+- **psycopg** — Shared Postgres access for the job/artifact contract
 - **PyMuPDF** — PDF rendering and vector extraction
 - **Anthropic Claude Vision** — AI floor plan interpretation
 - **trimesh + Shapely** — 3D mesh reconstruction
 - **pygltflib** — glTF/GLB export
-- **boto3** — AWS S3 artifact storage
 - **Docker** — Containerised deployment
