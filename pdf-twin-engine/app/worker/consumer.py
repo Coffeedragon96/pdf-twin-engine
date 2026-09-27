@@ -7,12 +7,15 @@ X2 worker kind (see x2-backend/worker/CONTRACT.md, "External processors").
 """
 
 import logging
+import math
+import shutil
 import tempfile
 import threading
 import time
 import uuid as uuidlib
 from pathlib import Path
 
+import anthropic
 import boto3
 
 from app.core.config import settings
@@ -20,13 +23,31 @@ from app.core.db import Database
 from app.services.emitter import emit_artifact
 from app.services.extractor import extract_pdf
 from app.services.interpreter import interpret_floor_plan
-from app.services.reconstructor import reconstruct_3d
+from app.services.reconstructor import COORD_SCALE, reconstruct_3d
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pdf-twin-engine")
 
 VISIBILITY_TIMEOUT_S = 120
 HEARTBEAT_INTERVAL_S = 45
+
+
+def _has_usable_wall_geometry(floor_schema: dict) -> bool:
+    """Mirrors reconstructor.reconstruct_3d's own wall-consumption logic
+    (start/end present, each with >=2 coords, and a non-zero scaled length)
+    so this check catches exactly the schemas that would otherwise trigger
+    reconstructor's empty-mesh fallback, without duplicating its code."""
+    for floor in floor_schema.get("floors", []) or []:
+        for wall in floor.get("walls", []) or []:
+            start = wall.get("start")
+            end = wall.get("end")
+            if not start or not end or len(start) < 2 or len(end) < 2:
+                continue
+            sx, sy = start[0] * COORD_SCALE, start[1] * COORD_SCALE
+            ex, ey = end[0] * COORD_SCALE, end[1] * COORD_SCALE
+            if math.hypot(ex - sx, ey - sy) >= 1e-4:
+                return True
+    return False
 
 
 class Consumer:
@@ -126,30 +147,41 @@ class Consumer:
             extraction = extract_pdf(str(pdf_path), metadata)
 
             self.db.progress(job["id"], 40, "interpreting")
-            floor_schema = interpret_floor_plan(extraction, metadata)
+            try:
+                floor_schema = interpret_floor_plan(extraction, metadata)
+            except anthropic.BadRequestError as exc:
+                raise RuntimeError(
+                    "Failed to interpret floor plan: Claude did not return a valid structured response"
+                ) from exc
+
+            if not _has_usable_wall_geometry(floor_schema):
+                raise RuntimeError("No floor-plan geometry detected in the PDF")
 
             self.db.progress(job["id"], 65, "reconstructing")
             glb_path = Path(reconstruct_3d(job["job_uuid"], floor_schema))
 
-            self.db.progress(job["id"], 85, "uploading")
-            artifact_uuid = str(uuidlib.uuid4())
-            root_path, size_bytes = emit_artifact(job, artifact_uuid, glb_path)
+            try:
+                self.db.progress(job["id"], 85, "uploading")
+                artifact_uuid = str(uuidlib.uuid4())
+                root_path, size_bytes = emit_artifact(job, artifact_uuid, glb_path)
 
-            self.db.succeed_with_artifact(
-                job,
-                artifact_uuid=artifact_uuid,
-                name=metadata["building_name"],
-                root_path=root_path,
-                entry_file="model.glb",
-                size_bytes=size_bytes,
-                metadata={
-                    "floors": len(floor_schema.get("floors", [])),
-                    "confidence": floor_schema.get("confidence", 0),
-                    "building_name": metadata["building_name"],
-                    "address": metadata["address"],
-                    "scale_meters": metadata["scale_meters"],
-                },
-            )
+                self.db.succeed_with_artifact(
+                    job,
+                    artifact_uuid=artifact_uuid,
+                    name=metadata["building_name"],
+                    root_path=root_path,
+                    entry_file="model.glb",
+                    size_bytes=size_bytes,
+                    metadata={
+                        "floors": len(floor_schema.get("floors", [])),
+                        "confidence": floor_schema.get("confidence", 0),
+                        "building_name": metadata["building_name"],
+                        "address": metadata["address"],
+                        "scale_meters": metadata["scale_meters"],
+                    },
+                )
+            finally:
+                shutil.rmtree(glb_path.parent, ignore_errors=True)
 
     def _download_source(self, job: dict, dest: Path) -> None:
         kwargs = {"region_name": settings.S3_REGION}
