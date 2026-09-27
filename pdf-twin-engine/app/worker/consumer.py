@@ -65,7 +65,10 @@ class Consumer:
                 time.sleep(5)
                 continue
             for msg in resp.get("Messages", []):
-                self._process_message(msg)
+                try:
+                    self._process_message(msg)
+                except Exception:  # noqa: BLE001 — one bad message must not kill the process
+                    log.exception("unhandled error processing message; continuing")
 
     def _process_message(self, msg):
         receipt = msg["ReceiptHandle"]

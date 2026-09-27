@@ -53,6 +53,36 @@ def test_process_message_marks_job_failed_on_pipeline_error():
     sqs.delete_message.assert_called_once_with(QueueUrl="https://queue/pdf-twin", ReceiptHandle="r3")
 
 
+def test_run_survives_exception_from_process_message_and_continues():
+    consumer, sqs, db = _make_consumer()
+    msg1 = {"Body": "boom", "ReceiptHandle": "r5"}
+    msg2 = {"Body": "ok", "ReceiptHandle": "r6"}
+
+    calls = []
+
+    def _process_message(msg):
+        calls.append(msg)
+        if msg is msg1:
+            raise RuntimeError("boom")
+
+    consumer._process_message = _process_message
+
+    served = {"done": False}
+
+    def _receive(*args, **kwargs):
+        if not served["done"]:
+            served["done"] = True
+            return {"Messages": [msg1, msg2]}
+        consumer._stopping = True
+        return {"Messages": []}
+
+    sqs.receive_message.side_effect = _receive
+
+    consumer.run()
+
+    assert calls == [msg1, msg2]
+
+
 def test_process_message_does_not_fail_job_on_success():
     consumer, sqs, db = _make_consumer()
     job_uuid = str(uuid.uuid4())
