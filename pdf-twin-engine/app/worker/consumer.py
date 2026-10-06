@@ -15,11 +15,11 @@ import time
 import uuid as uuidlib
 from pathlib import Path
 
-import anthropic
 import boto3
 
 from app.core.config import settings
 from app.core.db import Database
+from app.services.classifier import classify_pages
 from app.services.emitter import emit_artifact
 from app.services.extractor import extract_pdf
 from app.services.interpreter import interpret_floor_plan
@@ -48,6 +48,31 @@ def _has_usable_wall_geometry(floor_schema: dict) -> bool:
             if math.hypot(ex - sx, ey - sy) >= 1e-4:
                 return True
     return False
+
+
+def _select_floor_plan_candidates(classifications: list) -> tuple:
+    """Filters to is_floor_plan candidates, deduped by floor_index (keeps
+    the higher-confidence one), ordered by floor_index ascending.
+
+    Returns (candidates, duplicate_losers) — duplicate_losers are the
+    lower-confidence classifications that lost a floor_index collision,
+    for the caller to record in the skip list rather than discard silently.
+    """
+    floor_plan_only = [c for c in classifications if c.get("is_floor_plan")]
+    best_by_index = {}
+    duplicates = []
+    for c in floor_plan_only:
+        idx = c["floor_index"]
+        existing = best_by_index.get(idx)
+        if existing is None:
+            best_by_index[idx] = c
+        elif c["confidence"] > existing["confidence"]:
+            duplicates.append(existing)
+            best_by_index[idx] = c
+        else:
+            duplicates.append(c)
+    ordered = sorted(best_by_index.values(), key=lambda c: c["floor_index"])
+    return ordered, duplicates
 
 
 class Consumer:
@@ -146,16 +171,54 @@ class Consumer:
             self.db.progress(job["id"], 15, "extracting")
             extraction = extract_pdf(str(pdf_path), metadata)
 
-            self.db.progress(job["id"], 40, "interpreting")
-            try:
-                floor_schema = interpret_floor_plan(extraction, metadata)
-            except anthropic.BadRequestError as exc:
-                raise RuntimeError(
-                    "Failed to interpret floor plan: Claude did not return a valid structured response"
-                ) from exc
+            self.db.progress(job["id"], 30, "classifying")
+            classifications = classify_pages(extraction, metadata)
+            candidates, duplicates = _select_floor_plan_candidates(classifications)
 
-            if not _has_usable_wall_geometry(floor_schema):
+            if not candidates:
                 raise RuntimeError("No floor-plan geometry detected in the PDF")
+
+            pages_by_index = {p["page_index"]: p for p in extraction.get("pages", [])}
+            vectors = extraction.get("vector_geometry") or []
+            skipped = [
+                {"page_index": d["page_index"], "floor_label": d["floor_label"], "reason": "duplicate_floor_index"}
+                for d in duplicates
+            ]
+            combined_floors = []
+            confidences = []
+
+            self.db.progress(job["id"], 40, "interpreting")
+            for candidate in candidates:
+                page = pages_by_index[candidate["page_index"]]
+                page_extraction = {
+                    "total_pages": 1,
+                    "pages": [page],
+                    "vector_geometry": [v for v in vectors if v.get("page") == candidate["page_index"]] or None,
+                    "metadata": metadata,
+                }
+                try:
+                    page_schema = interpret_floor_plan(page_extraction, metadata)
+                    page_floors = page_schema.get("floors") or []
+                    if not page_floors or not _has_usable_wall_geometry(page_schema):
+                        skipped.append({"page_index": candidate["page_index"], "floor_label": candidate["floor_label"], "reason": "no_usable_geometry"})
+                        continue
+                except Exception as exc:  # noqa: BLE001 — one bad floor must never fail the job
+                    log.warning("interpretation failed for floor %s (page %s): %s", candidate["floor_index"], candidate["page_index"], exc)
+                    skipped.append({"page_index": candidate["page_index"], "floor_label": candidate["floor_label"], "reason": "interpretation_failed"})
+                    continue
+
+                floor = dict(page_floors[0])
+                floor["index"] = candidate["floor_index"]
+                combined_floors.append(floor)
+                confidences.append(page_schema.get("confidence", 0.0))
+
+            if not combined_floors:
+                raise RuntimeError("No floor-plan geometry detected in the PDF")
+
+            floor_schema = {
+                "confidence": min(confidences) if confidences else 0.0,
+                "floors": combined_floors,
+            }
 
             self.db.progress(job["id"], 65, "reconstructing")
             glb_path = Path(reconstruct_3d(job["job_uuid"], floor_schema))
@@ -178,6 +241,9 @@ class Consumer:
                         "building_name": metadata["building_name"],
                         "address": metadata["address"],
                         "scale_meters": metadata["scale_meters"],
+                        "floors_identified": len(candidates),
+                        "floors_reconstructed": len(combined_floors),
+                        "floors_skipped": skipped,
                     },
                 )
             finally:

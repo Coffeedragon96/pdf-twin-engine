@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import anthropic
 import pytest
 
-from app.worker.consumer import Consumer
+from app.worker.consumer import Consumer, _select_floor_plan_candidates
 
 
 def _make_consumer():
@@ -123,15 +123,16 @@ def test_run_pipeline_rejects_schema_with_no_usable_walls():
     job instead of letting reconstructor's empty-mesh fallback succeed."""
     consumer, _sqs, db = _make_consumer()
     job = _make_job()
+    extraction = {"pages": [{"page_index": 0, "image_b64": "x", "width": 1, "height": 1}], "vector_geometry": None}
+    classifications = [{"page_index": 0, "is_floor_plan": True, "floor_index": 0, "floor_label": "L1", "confidence": 0.9}]
 
     with patch("app.worker.consumer.boto3") as mock_boto3, \
-         patch("app.worker.consumer.extract_pdf") as mock_extract, \
-         patch("app.worker.consumer.interpret_floor_plan") as mock_interpret, \
+         patch("app.worker.consumer.extract_pdf", return_value=extraction), \
+         patch("app.worker.consumer.classify_pages", return_value=classifications), \
+         patch("app.worker.consumer.interpret_floor_plan", return_value={"floors": [], "confidence": 0.1}), \
          patch("app.worker.consumer.reconstruct_3d") as mock_reconstruct, \
          patch("app.worker.consumer.emit_artifact") as mock_emit:
         mock_boto3.client.return_value = MagicMock()
-        mock_extract.return_value = {"pages": []}
-        mock_interpret.return_value = {"floors": [], "confidence": 0.1}
 
         with pytest.raises(RuntimeError, match="No floor-plan geometry detected"):
             consumer._run_pipeline(job)
@@ -156,11 +157,16 @@ def test_run_pipeline_rejects_schema_with_no_usable_walls():
     db2.succeed_with_artifact.assert_not_called()
 
 
-def test_run_pipeline_wraps_anthropic_bad_request_error():
-    """IMPORTANT 4: a BadRequestError from interpret_floor_plan must be
-    rewritten into a clear message before it reaches db.fail."""
+def test_run_pipeline_skips_candidate_on_anthropic_bad_request_error():
+    """A BadRequestError for the only candidate page is skip-and-continue
+    (per-page interpretation failures never fail the job directly) — with
+    only one candidate, zero floors survive, so the job still fails, but
+    with the generic no-geometry message, not a BadRequestError-specific
+    one (the specific reason is recorded in floors_skipped/logs instead)."""
     consumer, _sqs, db = _make_consumer()
     job = _make_job()
+    extraction = {"pages": [{"page_index": 0, "image_b64": "x", "width": 1, "height": 1}], "vector_geometry": None}
+    classifications = [{"page_index": 0, "is_floor_plan": True, "floor_index": 0, "floor_label": "L1", "confidence": 0.9}]
 
     bad_request = anthropic.BadRequestError(
         message="400 error from broken retry payload",
@@ -169,37 +175,34 @@ def test_run_pipeline_wraps_anthropic_bad_request_error():
     )
 
     with patch("app.worker.consumer.boto3") as mock_boto3, \
-         patch("app.worker.consumer.extract_pdf") as mock_extract, \
+         patch("app.worker.consumer.extract_pdf", return_value=extraction), \
+         patch("app.worker.consumer.classify_pages", return_value=classifications), \
          patch("app.worker.consumer.interpret_floor_plan", side_effect=bad_request), \
          patch("app.worker.consumer.reconstruct_3d") as mock_reconstruct:
         mock_boto3.client.return_value = MagicMock()
-        mock_extract.return_value = {"pages": []}
 
         try:
             consumer._run_pipeline(job)
             assert False, "expected RuntimeError"
         except RuntimeError as exc:
-            assert "Failed to interpret floor plan" in str(exc)
-            assert "did not return a valid structured response" in str(exc)
+            assert "No floor-plan geometry detected" in str(exc)
 
         mock_reconstruct.assert_not_called()
 
-    # End-to-end through _process_message -> db.fail with the clear message.
+    # End-to-end through _process_message -> db.fail with that message.
     consumer2, sqs2, db2 = _make_consumer()
     db2.claim_job.return_value = job
     msg = {"Body": job["job_uuid"], "ReceiptHandle": "rB"}
 
     def _raise(_job):
-        raise RuntimeError(
-            "Failed to interpret floor plan: Claude did not return a valid structured response"
-        )
+        raise RuntimeError("No floor-plan geometry detected in the PDF")
     consumer2._run_pipeline = _raise
 
     consumer2._process_message(msg)
 
     db2.fail.assert_called_once()
     args, _ = db2.fail.call_args
-    assert "Failed to interpret floor plan" in args[1]
+    assert "No floor-plan geometry detected" in args[1]
 
 
 def test_run_pipeline_success_calls_succeed_with_artifact_and_cleans_up(tmp_path):
@@ -214,6 +217,8 @@ def test_run_pipeline_success_calls_succeed_with_artifact_and_cleans_up(tmp_path
     glb_path = glb_dir / "model.glb"
     glb_path.write_bytes(b"fake-glb-bytes")
 
+    extraction = {"pages": [{"page_index": 0, "image_b64": "x", "width": 1, "height": 1}], "vector_geometry": None}
+    classifications = [{"page_index": 0, "is_floor_plan": True, "floor_index": 0, "floor_label": "L1", "confidence": 0.9}]
     floor_schema = {
         "confidence": 0.92,
         "floors": [
@@ -222,12 +227,12 @@ def test_run_pipeline_success_calls_succeed_with_artifact_and_cleans_up(tmp_path
     }
 
     with patch("app.worker.consumer.boto3") as mock_boto3, \
-         patch("app.worker.consumer.extract_pdf") as mock_extract, \
+         patch("app.worker.consumer.extract_pdf", return_value=extraction), \
+         patch("app.worker.consumer.classify_pages", return_value=classifications), \
          patch("app.worker.consumer.interpret_floor_plan", return_value=floor_schema), \
          patch("app.worker.consumer.reconstruct_3d", return_value=str(glb_path)) as mock_reconstruct, \
          patch("app.worker.consumer.emit_artifact", return_value=("org-uuid-1/artifact-1", 14)) as mock_emit:
         mock_boto3.client.return_value = MagicMock()
-        mock_extract.return_value = {"pages": []}
 
         consumer._run_pipeline(job)
 
@@ -244,6 +249,124 @@ def test_run_pipeline_success_calls_succeed_with_artifact_and_cleans_up(tmp_path
     assert kwargs["metadata"]["building_name"] == "Tower A"
     assert kwargs["metadata"]["address"] == "1 Main St"
     assert kwargs["metadata"]["scale_meters"] == 1.0
+    assert kwargs["metadata"]["floors_identified"] == 1
+    assert kwargs["metadata"]["floors_reconstructed"] == 1
+    assert kwargs["metadata"]["floors_skipped"] == []
 
     # IMPORTANT 3: glb_path.parent must be removed after the run, win or lose.
     assert not glb_dir.exists()
+
+
+def test_select_floor_plan_candidates_orders_by_floor_index():
+    classifications = [
+        {"page_index": 0, "is_floor_plan": False, "floor_index": 0, "floor_label": "COVER", "confidence": 0.9},
+        {"page_index": 2, "is_floor_plan": True, "floor_index": 1, "floor_label": "L2", "confidence": 0.9},
+        {"page_index": 1, "is_floor_plan": True, "floor_index": 0, "floor_label": "GROUND", "confidence": 0.9},
+    ]
+
+    candidates, duplicates = _select_floor_plan_candidates(classifications)
+
+    assert [c["page_index"] for c in candidates] == [1, 2]
+    assert duplicates == []
+
+
+def test_select_floor_plan_candidates_dedupes_by_floor_index():
+    classifications = [
+        {"page_index": 0, "is_floor_plan": True, "floor_index": 0, "floor_label": "GROUND A", "confidence": 0.6},
+        {"page_index": 1, "is_floor_plan": True, "floor_index": 0, "floor_label": "GROUND B", "confidence": 0.9},
+    ]
+
+    candidates, duplicates = _select_floor_plan_candidates(classifications)
+
+    assert len(candidates) == 1
+    assert candidates[0]["page_index"] == 1
+    assert len(duplicates) == 1
+    assert duplicates[0]["page_index"] == 0
+
+
+def test_select_floor_plan_candidates_returns_empty_for_no_floor_plans():
+    classifications = [{"page_index": 0, "is_floor_plan": False, "floor_index": 0, "floor_label": "", "confidence": 0.9}]
+
+    candidates, duplicates = _select_floor_plan_candidates(classifications)
+
+    assert candidates == []
+    assert duplicates == []
+
+
+def test_run_pipeline_fails_when_no_floor_plan_pages_identified():
+    consumer, _sqs, db = _make_consumer()
+    job = _make_job()
+    extraction = {"pages": [{"page_index": 0, "image_b64": "x", "width": 1, "height": 1}], "vector_geometry": None}
+    classifications = [{"page_index": 0, "is_floor_plan": False, "floor_index": 0, "floor_label": "COVER", "confidence": 0.9}]
+
+    with patch("app.worker.consumer.boto3") as mock_boto3, \
+         patch("app.worker.consumer.extract_pdf", return_value=extraction), \
+         patch("app.worker.consumer.classify_pages", return_value=classifications):
+        mock_boto3.client.return_value = MagicMock()
+
+        with pytest.raises(RuntimeError, match="No floor-plan geometry detected"):
+            consumer._run_pipeline(job)
+
+
+def test_run_pipeline_skips_candidate_with_empty_floors_list(tmp_path):
+    consumer, _sqs, db = _make_consumer()
+    job = _make_job()
+    extraction = {
+        "pages": [
+            {"page_index": 0, "image_b64": "x", "width": 1, "height": 1},
+            {"page_index": 1, "image_b64": "y", "width": 1, "height": 1},
+        ],
+        "vector_geometry": None,
+    }
+    classifications = [
+        {"page_index": 0, "is_floor_plan": True, "floor_index": 0, "floor_label": "L1", "confidence": 0.9},
+        {"page_index": 1, "is_floor_plan": True, "floor_index": 1, "floor_label": "L2", "confidence": 0.9},
+    ]
+    good_schema = {"confidence": 0.9, "floors": [{"index": 0, "height_m": 3.0, "walls": [{"start": [0, 0], "end": [100, 0]}]}]}
+    empty_schema = {"confidence": 0.5, "floors": []}
+
+    glb_path = tmp_path / "model.glb"
+    glb_path.write_bytes(b"x")
+
+    with patch("app.worker.consumer.boto3") as mock_boto3, \
+         patch("app.worker.consumer.extract_pdf", return_value=extraction), \
+         patch("app.worker.consumer.classify_pages", return_value=classifications), \
+         patch("app.worker.consumer.interpret_floor_plan", side_effect=[good_schema, empty_schema]), \
+         patch("app.worker.consumer.reconstruct_3d", return_value=str(glb_path)), \
+         patch("app.worker.consumer.emit_artifact", return_value=("root", 10)):
+        mock_boto3.client.return_value = MagicMock()
+        consumer._run_pipeline(job)
+
+    _args, kwargs = consumer.db.succeed_with_artifact.call_args
+    assert kwargs["metadata"]["floors_reconstructed"] == 1
+    assert kwargs["metadata"]["floors_identified"] == 2
+    assert kwargs["metadata"]["floors_skipped"][0]["page_index"] == 1
+    assert kwargs["metadata"]["floors_skipped"][0]["reason"] == "no_usable_geometry"
+
+
+def test_run_pipeline_single_floor_plan_page_still_works(tmp_path):
+    consumer, _sqs, db = _make_consumer()
+    job = _make_job()
+    extraction = {"pages": [{"page_index": 0, "image_b64": "x", "width": 1, "height": 1}], "vector_geometry": None}
+    classifications = [{"page_index": 0, "is_floor_plan": True, "floor_index": 0, "floor_label": "L1", "confidence": 0.9}]
+    schema = {"confidence": 0.9, "floors": [{"index": 0, "height_m": 3.0, "walls": [{"start": [0, 0], "end": [100, 0]}]}]}
+
+    glb_path = tmp_path / "model.glb"
+    glb_path.write_bytes(b"x")
+
+    with patch("app.worker.consumer.boto3") as mock_boto3, \
+         patch("app.worker.consumer.extract_pdf", return_value=extraction), \
+         patch("app.worker.consumer.classify_pages", return_value=classifications), \
+         patch("app.worker.consumer.interpret_floor_plan", return_value=schema) as mock_interpret, \
+         patch("app.worker.consumer.reconstruct_3d", return_value=str(glb_path)) as mock_reconstruct, \
+         patch("app.worker.consumer.emit_artifact", return_value=("root", 10)):
+        mock_boto3.client.return_value = MagicMock()
+        consumer._run_pipeline(job)
+
+    mock_interpret.assert_called_once()
+    reconstruct_floor_schema = mock_reconstruct.call_args.args[1]
+    assert len(reconstruct_floor_schema["floors"]) == 1
+    assert reconstruct_floor_schema["floors"][0]["index"] == 0
+    kwargs = consumer.db.succeed_with_artifact.call_args.kwargs
+    assert kwargs["metadata"]["floors_reconstructed"] == 1
+    assert kwargs["metadata"]["floors_skipped"] == []
