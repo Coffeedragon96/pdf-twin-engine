@@ -173,6 +173,13 @@ class Consumer:
 
             self.db.progress(job["id"], 30, "classifying")
             classifications = classify_pages(extraction, metadata)
+            classification_failures = [c for c in classifications if c.get("error")]
+            if classifications and len(classification_failures) == len(classifications):
+                raise RuntimeError(
+                    f"Page classification failed for all {len(classifications)} pages: "
+                    f"{classification_failures[0]['error']}"
+                )
+
             candidates, duplicates = _select_floor_plan_candidates(classifications)
 
             if not candidates:
@@ -184,6 +191,10 @@ class Consumer:
                 {"page_index": d["page_index"], "floor_label": d["floor_label"], "reason": "duplicate_floor_index"}
                 for d in duplicates
             ]
+            skipped.extend(
+                {"page_index": c["page_index"], "floor_label": c.get("floor_label", ""), "reason": "classification_failed"}
+                for c in classification_failures
+            )
             combined_floors = []
             confidences = []
 
